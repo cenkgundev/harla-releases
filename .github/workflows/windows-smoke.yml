@@ -1,0 +1,90 @@
+name: Windows smoke test
+
+# Installs a Harla Windows installer from a (draft) release of this repository on a clean Windows,
+# runs the app's self-check, opens the app, takes a screenshot and uninstalls it.
+# The installer is built on a Mac (harla scripts/package-windows.sh); this is where it meets a real Windows.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag that holds the installer"
+        required: true
+      asset:
+        description: "Installer file name, e.g. Harla-1.4.2.exe"
+        required: true
+
+# Draft releases are only visible with write access to contents.
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag }}
+  ASSET: ${{ inputs.asset }}
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - name: Download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$ASSET" =~ ^Harla-[0-9.]+\.exe$ ]] || { echo "asset must look like Harla-1.4.2.exe"; exit 1; }
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET"
+          sha256sum "$ASSET"
+
+      - name: Install (silent, per user)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\$env:ASSET" -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
+          $dir = "$env:LOCALAPPDATA\Programs\Harla"
+          foreach ($f in 'Harla.exe','Uninstall.exe','runtime\bin\javaw.exe','app\desktopApp.jar') {
+            if (-not (Test-Path "$dir\$f")) { throw "missing $f" }
+          }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Harla.lnk")) { throw "no Start menu shortcut" }
+          Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Harla' | Format-List DisplayName,DisplayVersion,InstallLocation
+
+      - name: Self-check
+        shell: pwsh
+        run: |
+          $dir = "$env:LOCALAPPDATA\Programs\Harla"
+          & "$dir\runtime\bin\java.exe" "-Djpackage.app-path=$dir\Harla.exe" -cp "$dir\app\*" harla.desktop.MainKt --self-check
+          if ($LASTEXITCODE -ne 0) { throw "self-check failed ($LASTEXITCODE)" }
+
+      - name: Open the app and take a screenshot
+        shell: pwsh
+        run: |
+          $dir = "$env:LOCALAPPDATA\Programs\Harla"
+          Start-Process "$dir\Harla.exe"
+          Start-Sleep -Seconds 40
+          $java = Get-Process javaw -ErrorAction SilentlyContinue
+          if (-not $java) {
+            Get-ChildItem "$env:APPDATA\Harla\logs" -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Tail 80 }
+            throw "Harla is not running 40 s after the launcher"
+          }
+          $java | Format-Table Id,MainWindowTitle,WorkingSet64
+          Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$PWD\harla-windows.png")
+          if (Test-Path "$env:APPDATA\Harla\logs\harla.log") { Get-Content "$env:APPDATA\Harla\logs\harla.log" -Tail 40 }
+          $java | Stop-Process -Force
+
+      - name: Uninstall
+        shell: pwsh
+        run: |
+          $dir = "$env:LOCALAPPDATA\Programs\Harla"
+          Start-Process "$dir\Uninstall.exe" -ArgumentList '/S' -Wait
+          Start-Sleep -Seconds 5
+          if (Test-Path "$dir\app") { throw "app folder left behind" }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Harla') { throw "Apps entry left behind" }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: harla-windows-smoke
+          path: harla-windows.png
+          if-no-files-found: ignore
